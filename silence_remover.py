@@ -82,22 +82,14 @@ class SilenceRemoverApp:
         self.threshold_entry.pack(side=tk.RIGHT)
         ttk.Label(thresh_frame, text="(lower = quieter sounds count as silence)", foreground="gray").pack(side=tk.RIGHT, padx=(0, 10))
         
-        # Minimum silence duration (for detection)
+        # Minimum silence duration to split
         min_silence_frame = ttk.Frame(settings_frame)
         min_silence_frame.pack(fill=tk.X, pady=3)
-        ttk.Label(min_silence_frame, text="Min silence to detect (sec):").pack(side=tk.LEFT)
-        self.min_silence_var = tk.StringVar(value="0.5")
+        ttk.Label(min_silence_frame, text="Min silence to split (sec):").pack(side=tk.LEFT)
+        self.min_silence_var = tk.StringVar(value="1.0")
         self.min_silence_entry = ttk.Entry(min_silence_frame, textvariable=self.min_silence_var, width=10)
         self.min_silence_entry.pack(side=tk.RIGHT)
-        
-        # Minimum silence duration for break
-        min_break_frame = ttk.Frame(settings_frame)
-        min_break_frame.pack(fill=tk.X, pady=3)
-        ttk.Label(min_break_frame, text="Min silence to split clip (sec):").pack(side=tk.LEFT)
-        self.min_break_var = tk.StringVar(value="1.0")
-        self.min_break_entry = ttk.Entry(min_break_frame, textvariable=self.min_break_var, width=10)
-        self.min_break_entry.pack(side=tk.RIGHT)
-        ttk.Label(min_break_frame, text="(shorter gaps merged)", foreground="gray").pack(side=tk.RIGHT, padx=(0, 10))
+        ttk.Label(min_silence_frame, text="(shorter gaps merged)", foreground="gray").pack(side=tk.RIGHT, padx=(0, 10))
         
         # Minimum clip length
         min_clip_frame = ttk.Frame(settings_frame)
@@ -192,7 +184,6 @@ class SilenceRemoverApp:
         try:
             threshold = float(self.threshold_var.get())
             min_silence = float(self.min_silence_var.get())
-            min_break = float(self.min_break_var.get())
             min_clip = float(self.min_clip_var.get())
             buffer_time = self.buffer_var.get()
         except ValueError:
@@ -205,11 +196,11 @@ class SilenceRemoverApp:
         
         thread = threading.Thread(
             target=self.process_file,
-            args=(threshold, min_silence, min_break, min_clip, buffer_time, buffer_time)
+            args=(threshold, min_silence, min_clip, buffer_time, buffer_time)
         )
         thread.start()
     
-    def process_file(self, threshold, min_silence, min_break, min_clip, buffer_start, buffer_end):
+    def process_file(self, threshold, min_silence, min_clip, buffer_start, buffer_end):
         try:
             self.set_status("Detecting silence...")
             self.log("Analyzing audio for silence...")
@@ -233,11 +224,7 @@ class SilenceRemoverApp:
             
             self.log(f"File duration: {duration:.2f}s")
             
-            # Filter out silences that are too short to split on
-            filtered_silences = [(s, e) for s, e in silent_ranges if (e - s) >= min_break]
-            self.log(f"Silences long enough to split: {len(filtered_silences)}")
-            
-            segments = self.get_non_silent_segments(filtered_silences, duration, buffer_start, buffer_end)
+            segments = self.get_non_silent_segments(silent_ranges, duration, buffer_start, buffer_end)
             
             # Filter out clips that are too short
             original_count = len(segments)
