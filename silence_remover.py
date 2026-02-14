@@ -73,15 +73,6 @@ class SilenceRemoverApp:
         settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding="10")
         settings_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # Silence threshold
-        thresh_frame = ttk.Frame(settings_frame)
-        thresh_frame.pack(fill=tk.X, pady=3)
-        ttk.Label(thresh_frame, text="Silence threshold (dB):").pack(side=tk.LEFT)
-        self.threshold_var = tk.StringVar(value="-40")
-        self.threshold_entry = ttk.Entry(thresh_frame, textvariable=self.threshold_var, width=10)
-        self.threshold_entry.pack(side=tk.RIGHT)
-        ttk.Label(thresh_frame, text="(lower = quieter sounds count as silence)", foreground="gray").pack(side=tk.RIGHT, padx=(0, 10))
-        
         # Minimum silence duration to split
         min_silence_frame = ttk.Frame(settings_frame)
         min_silence_frame.pack(fill=tk.X, pady=3)
@@ -99,6 +90,15 @@ class SilenceRemoverApp:
         self.min_clip_entry = ttk.Entry(min_clip_frame, textvariable=self.min_clip_var, width=10)
         self.min_clip_entry.pack(side=tk.RIGHT)
         ttk.Label(min_clip_frame, text="(shorter clips skipped)", foreground="gray").pack(side=tk.RIGHT, padx=(0, 10))
+        
+        # Max blip to ignore
+        blip_frame = ttk.Frame(settings_frame)
+        blip_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(blip_frame, text="Ignore sounds shorter than (sec):").pack(side=tk.LEFT)
+        self.max_blip_var = tk.StringVar(value="0.3")
+        self.max_blip_entry = ttk.Entry(blip_frame, textvariable=self.max_blip_var, width=10)
+        self.max_blip_entry.pack(side=tk.RIGHT)
+        ttk.Label(blip_frame, text="(blips in silence)", foreground="gray").pack(side=tk.RIGHT, padx=(0, 10))
         
         # Buffer slider
         buffer_frame = ttk.Frame(settings_frame)
@@ -182,9 +182,9 @@ class SilenceRemoverApp:
         
         # Validate inputs
         try:
-            threshold = float(self.threshold_var.get())
             min_silence = float(self.min_silence_var.get())
             min_clip = float(self.min_clip_var.get())
+            max_blip = float(self.max_blip_var.get())
             buffer_time = self.buffer_var.get()
         except ValueError:
             messagebox.showerror("Error", "Invalid numeric values in settings.")
@@ -196,24 +196,45 @@ class SilenceRemoverApp:
         
         thread = threading.Thread(
             target=self.process_file,
-            args=(threshold, min_silence, min_clip, buffer_time, buffer_time)
+            args=(min_silence, min_clip, max_blip, buffer_time, buffer_time)
         )
         thread.start()
     
-    def process_file(self, threshold, min_silence, min_clip, buffer_start, buffer_end):
+    def process_file(self, min_silence, min_clip, max_blip, buffer_start, buffer_end):
         try:
-            self.set_status("Detecting silence...")
-            self.log("Analyzing audio for silence...")
-            self.progress_var.set(10)
+            self.set_status("Analyzing audio levels...")
+            self.log("Analyzing audio to detect noise floor...")
+            self.progress_var.set(5)
             
-            silent_ranges = self.detect_silence(self.selected_file, threshold, min_silence)
+            # Auto-detect silence threshold
+            threshold = self.detect_noise_floor(self.selected_file)
+            if threshold is None:
+                self.log("Could not analyze audio, using default threshold")
+                threshold = -40
+            else:
+                self.log(f"Auto-detected silence threshold: {threshold:.1f} dB")
+            
+            self.set_status("Detecting silence...")
+            self.progress_var.set(15)
+            
+            # Use a short min duration for initial detection, we'll merge later
+            silent_ranges = self.detect_silence(self.selected_file, threshold, 0.1)
             
             if silent_ranges is None:
                 self.log("Error detecting silence.")
                 self.set_status("Error")
                 return
             
-            self.log(f"Found {len(silent_ranges)} silent sections")
+            self.log(f"Found {len(silent_ranges)} initial silent sections")
+            
+            # Merge silent ranges that are separated by short blips
+            silent_ranges = self.merge_silences_with_blips(silent_ranges, max_blip)
+            self.log(f"After merging blips: {len(silent_ranges)} silent sections")
+            
+            # Filter to only silences long enough to split on
+            silent_ranges = [(s, e) for s, e in silent_ranges if (e - s) >= min_silence]
+            self.log(f"Silences >= {min_silence}s: {len(silent_ranges)}")
+            
             self.progress_var.set(30)
             
             duration = self.get_duration(self.selected_file)
@@ -273,6 +294,68 @@ class SilenceRemoverApp:
         finally:
             self.processing = False
             self.root.after(0, lambda: self.process_btn.config(state=tk.NORMAL))
+    
+    def detect_noise_floor(self, filepath):
+        """Analyze audio to find the noise floor and set threshold dynamically."""
+        cmd = [
+            get_ffmpeg_path(), "-i", filepath,
+            "-af", "volumedetect",
+            "-f", "null", "-"
+        ]
+        
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            output = result.stderr
+            
+            # Extract mean and max volume
+            mean_match = re.search(r"mean_volume:\s*([-\d.]+)\s*dB", output)
+            max_match = re.search(r"max_volume:\s*([-\d.]+)\s*dB", output)
+            
+            if mean_match and max_match:
+                mean_vol = float(mean_match.group(1))
+                max_vol = float(max_match.group(1))
+                
+                # Set threshold between mean and a reasonable floor
+                # Silence should be significantly quieter than the mean
+                # Use mean - 15dB as threshold, but not lower than -50dB
+                threshold = max(mean_vol - 15, -50)
+                
+                # Also ensure it's not too close to max (for quiet recordings)
+                if threshold > max_vol - 10:
+                    threshold = max_vol - 20
+                
+                return threshold
+            
+            return None
+        except Exception as e:
+            self.log(f"Volume detection error: {e}")
+            return None
+    
+    def merge_silences_with_blips(self, silent_ranges, max_blip):
+        """Merge silent ranges that are separated by short sound blips."""
+        if not silent_ranges or len(silent_ranges) < 2:
+            return silent_ranges
+        
+        merged = [silent_ranges[0]]
+        
+        for i in range(1, len(silent_ranges)):
+            prev_end = merged[-1][1]
+            curr_start, curr_end = silent_ranges[i]
+            
+            # Gap between silences (the non-silent part)
+            gap = curr_start - prev_end
+            
+            if gap <= max_blip:
+                # Blip is short enough to ignore - merge the silences
+                merged[-1] = (merged[-1][0], curr_end)
+            else:
+                # Gap is too long, keep as separate silence
+                merged.append((curr_start, curr_end))
+        
+        return merged
     
     def detect_silence(self, filepath, threshold, min_duration):
         cmd = [
